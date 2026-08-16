@@ -9,7 +9,7 @@
 # %% [markdown]
 # ## 1. Imports and Setup
 # %%
-!pip install -q faiss-cpu
+# pip install -q faiss-cpu
 import os
 import time
 import json
@@ -416,3 +416,163 @@ print(
     "images IVFPQ returns instead are typically close substitutes. The retrieval quality "
     "degrades gracefully rather than catastrophically."
 )
+
+# %% [markdown]
+# ## 8. Text-to-Image Search
+# CLIP was trained to put text and images in the same space, so we can literally
+# just encode a sentence with the text tower and search our image index.
+# No retraining, no alignment step -- it just works.
+# %%
+
+def encode_text(queries):
+    """Run text through CLIP's text tower, L2-normalize, return numpy."""
+    inputs = processor(
+        text=queries, return_tensors="pt",
+        padding=True, truncation=True, max_length=77
+    ).to(DEVICE)
+    with torch.no_grad():
+        out = model.text_model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"]
+        )
+        features = model.text_projection(out[1])  # pooler_output
+    emb = features.cpu().numpy().astype("float32")
+    faiss.normalize_L2(emb)
+    return emb
+
+
+# grab the exact index so results are perfect (no approximation noise)
+index_exact = faiss.read_index(flat_path)
+
+# picked queries that should clearly exist in flickr30k
+demo_queries = [
+    "a dog playing on the beach",
+    "people riding bicycles in a city",
+    "a child playing in the snow",
+    "a cat sitting on a windowsill",
+    "a group of people at a concert",
+]
+
+for text_query in demo_queries:
+    q_vec = encode_text([text_query])
+    D, I = index_exact.search(q_vec, 5)
+
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+    fig.suptitle(f'"{text_query}"', fontsize=14, fontweight="bold")
+
+    for j in range(5):
+        idx = I[0][j]
+        path = index_paths[idx] if idx < len(index_paths) else None
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception:
+            img = Image.new("RGB", (224, 224), (128, 128, 128))
+        axes[j].imshow(img)
+        axes[j].set_title(f"sim: {D[0][j]:.3f}", fontsize=10)
+        axes[j].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+    print()
+
+# %% [markdown]
+# ## 9. Caption-Based Semantic Evaluation
+# This is the eval that actually matters. Flickr30K has 5 human captions per image.
+# We treat each caption as a text query, search for images, and check if the
+# correct image shows up in the top K. Real ground truth, not just
+# "does approximate match exact."
+# %%
+import pandas as pd
+
+# hunt for the captions file -- kaggle mounts datasets in unpredictable paths
+captions_path = None
+for root, dirs, files in os.walk("/kaggle/input"):
+    for f in files:
+        if f.lower() == "results.csv":
+            captions_path = os.path.join(root, f)
+            break
+    if captions_path:
+        break
+
+if captions_path is None:
+    print("No captions file found (results.csv). Skipping semantic eval.")
+    print("Make sure the Flickr30K dataset includes the captions CSV.")
+else:
+    print(f"Found captions at: {captions_path}")
+
+    # flickr30k's csv is pipe-separated and the whitespace is all over the place
+    raw_lines = open(captions_path, "r").readlines()
+
+    records = []
+    for line in raw_lines[1:]:
+        parts = line.strip().split("|")
+        if len(parts) >= 3:
+            img_name = parts[0].strip()
+            caption = parts[2].strip()
+            if img_name and caption and img_name.endswith(".jpg"):
+                records.append({"image_name": img_name, "caption": caption})
+
+    captions_df = pd.DataFrame(records)
+    print(f"Parsed {len(captions_df):,} captions across {captions_df['image_name'].nunique():,} images")
+
+    # we need to map each caption to the position of its image in our FAISS index
+    # images in the query set (held-out 10%) won't be in the index, so we skip those
+    path_to_idx = {}
+    for i, p in enumerate(index_paths):
+        path_to_idx[os.path.basename(p)] = i
+
+    captions_df["index_pos"] = captions_df["image_name"].map(path_to_idx)
+    valid = captions_df.dropna(subset=["index_pos"]).copy()
+    valid["index_pos"] = valid["index_pos"].astype(int)
+    print(f"Usable captions (image is in index set): {len(valid):,}")
+
+    # encoding 100k+ captions is slow, so we sample 2000
+    n_eval = min(2000, len(valid))
+    sample = valid.sample(n=n_eval, random_state=42)
+    print(f"Sampling {n_eval:,} captions for evaluation...")
+
+    # batch-encode all the captions
+    caption_texts = sample["caption"].tolist()
+    gold = sample["index_pos"].tolist()
+    text_embs = []
+
+    for i in tqdm(range(0, len(caption_texts), 64), desc="Encoding captions"):
+        batch = caption_texts[i : i + 64]
+        text_embs.append(encode_text(batch))
+
+    text_embs = np.concatenate(text_embs, axis=0)
+
+    # run the captions through all 3 indexes and measure recall
+    index_files = {
+        "FlatIP": flat_path,
+        "IVFFlat": ivf_path,
+        "IVFPQ": ivfpq_path,
+    }
+
+    print()
+    print("=" * 60)
+    print("Caption -> Image Retrieval (Semantic Recall)")
+    print("=" * 60)
+    print(f"{'Index':<10} | {'R@1':<8} | {'R@5':<8} | {'R@10':<8}")
+    print("-" * 45)
+
+    for name, path in index_files.items():
+        idx = faiss.read_index(path)
+        if hasattr(idx, "nprobe"):
+            idx.nprobe = 10
+
+        _, I = idx.search(text_embs, 10)
+
+        r = {}
+        for k in [1, 5, 10]:
+            hits = sum(1 for i, g in enumerate(gold) if g in I[i][:k])
+            r[k] = (hits / len(gold)) * 100
+
+        print(f"{name:<10} | {r[1]:<8.2f} | {r[5]:<8.2f} | {r[10]:<8.2f}")
+
+    print()
+    print("This is the metric that actually matters for a search engine.")
+    print("The Section 5 benchmark tells you how well approximate search copies exact search.")
+    print("This tells you whether the system retrieves the RIGHT image for a given description.")
+
+
