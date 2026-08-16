@@ -1,4 +1,4 @@
-# Visual Search Engine
+# CLIP-based Visual Search Engine with FAISS
 
 Image retrieval using CLIP embeddings and FAISS on Flickr30K. The point of this project was to understand the real tradeoffs between exact and approximate nearest-neighbor search -- not just read about them.
 
