@@ -68,9 +68,3 @@ python src/evaluate_tradeoffs.py
 python src/evaluate_semantic.py
 ```
 
-## Resume bullets
-
-- Built a zero-shot cross-modal retrieval system using CLIP (ViT-B/32) and FAISS to index 31K images from Flickr30K, achieving 50.7% Recall@10 on zero-shot caption-to-image queries.
-- Benchmarked exact (FlatIP) vs approximate (IVFFlat, IVFPQ) nearest neighbor search, demonstrating a 21x memory footprint reduction (56MB to 2.6MB) with a controlled 35% degradation in image-to-image Recall@10.
-- Conducted hyperparameter ablations on FAISS nprobe, proving that tuning the search scope provides sharp diminishing returns beyond 10 clusters (latency increased 4x for <1% recall gain).
-
