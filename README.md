@@ -1,70 +1,41 @@
 # CLIP-based Visual Search Engine with FAISS
 
-Image retrieval using CLIP embeddings and FAISS on Flickr30K. The point of this project was to understand the real tradeoffs between exact and approximate nearest-neighbor search -- not just read about them.
+This project uses CLIP ViT-B/32 to search Flickr30K by image or by caption. The image and text encoders produce 512-dimensional vectors in the same space. After L2 normalization, FAISS inner-product search ranks them by cosine similarity.
 
-I built three different FAISS indexes (exact, clustered, compressed) and benchmarked them against each other on memory, latency, and recall. Then I ran an nprobe ablation to see where the diminishing returns kick in.
+The pipeline uses a seeded 90/10 split of the image embeddings. It builds three indexes on the larger split.
 
-The system also does text-to-image search. CLIP puts images and text in the same vector space, so you build the index once from image embeddings and text queries just work -- no extra training or alignment step needed.
+- **FlatIP** searches every vector and provides the exact ranking.
+- **IVFFlat** groups the full vectors into 100 clusters and searches a subset of them.
+- **IVFPQ** uses the same cluster count and compresses vectors into 64 eight-bit codes.
 
-## How it works
+## Benchmarks
 
-Every image in Flickr30K goes through a frozen CLIP ViT-B/32 to get a 512-dim embedding vector. L2-normalize everything so that FAISS inner product equals cosine similarity. Split 90/10 into an index set (what we search over) and a held-out query set (what we measure recall with).
+The image benchmark measures how many of FlatIP's top 10 neighbors each index finds on the held-out images. It also reports the serialized index size and the median batch search time divided by the number of queries. The IVFPQ sweep tests `nprobe` values of 1, 5, 10, 20, and 50. The comparison across indexes uses 10 probes for both IVF indexes.
 
-Build three indexes on the index set:
-- **FlatIP**: brute-force exact search. Perfect recall, but O(n) per query.
-- **IVFFlat**: clusters the space into 100 Voronoi cells, only searches the nearest 10 (`nprobe=10`). Same memory, much faster.
-- **IVFPQ**: same clustering, but also compresses each vector with Product Quantization (m=64 subspaces, 8 bits each). Huge memory savings, some recall loss.
+The caption benchmark samples up to 2,000 Flickr30K captions whose images are in the index. A hit means the caption's paired image appears in the top results. This measures zero-shot caption retrieval.
 
-For text search: encode the query with CLIP's text tower, normalize, search the same image index. No extra alignment needed.
+On a full run with 31,783 images, 28,605 went into the index and 3,178 were held out for image queries. The FAISS measurements below used one OpenMP thread on an Apple M4.
 
-## Evaluation
+| Index | File size | Image Recall@10 | Caption Recall@10 |
+| --- | ---: | ---: | ---: |
+| FlatIP | 55.87 MiB | 100.00% | 50.50% |
+| IVFFlat | 56.28 MiB | 96.29% | 46.00% |
+| IVFPQ | 2.66 MiB | 65.63% | 38.70% |
 
-Two separate evaluations:
+IVFPQ made the serialized index 21× smaller. Moving from 10 to 50 probes raised image Recall@10 by 0.66 percentage points and took about 2.8× as long in this batch benchmark.
 
-**Index tradeoffs (approximate vs exact):** Run held-out image queries through all three indexes. Measures how much recall the approximate methods lose compared to brute force.
+## Run it
 
-**Semantic retrieval (caption-based):** Each Flickr30K image has 5 human captions. Encode each caption with CLIP's text tower, search the image index, check if the correct image appears in the top K. This is the metric that actually matters -- it tests whether the system retrieves the right image for a given description, not just whether approximate search copies exact search.
+Use Python 3.10 or newer and run the commands from the repository root. Set `FLICKR_DIR` to the directory containing the JPG files and `FLICKR_CAPTIONS` to the pipe-delimited `results.csv`. The scripts also check the usual local and Kaggle dataset paths. [Flickr30K download](https://www.kaggle.com/datasets/hsankesara/flickr-image-dataset)
 
-## What I found
-
-- **IVFFlat is basically free.** It gets 96.3% recall against exact search with similar latency. Unless your corpus is tiny, there's no reason to use brute force.
-- **IVFPQ trades recall for memory.** 21x compression (55.9 MB down to 2.7 MB) but recall drops to 65.5%. Worth it only when the full index doesn't fit in RAM.
-- **nprobe has sharp diminishing returns.** Going from nprobe=10 to nprobe=50 on IVFPQ: latency goes up 4.5x but recall barely moves (<1% gain). Classic knob you can tune per-application.
-- **When IVFPQ misses, it fails gracefully.** The failure analysis visualization shows that "missed" results are usually semantically similar images from neighboring clusters, not random garbage.
-
-## Structure
-
-```
-visual-search-engine/
-├── kaggle/
-│   └── notebook.py           # runs everything end-to-end with visualizations
-├── src/
-│   ├── feature_extractor.py  # CLIP embeddings + 90/10 split
-│   ├── build_index.py        # builds FlatIP / IVFFlat / IVFPQ indexes
-│   ├── evaluate_tradeoffs.py # memory / latency / recall benchmark
-│   └── evaluate_semantic.py  # caption-based cross-modal retrieval eval
-├── requirements.txt
-└── README.md
-```
-
-## Running it
-
-### Kaggle (recommended)
-1. Create a new Kaggle notebook
-2. Enable GPU (Settings -> Accelerator -> GPU T4 x2)
-3. Add the [Flickr30K dataset](https://www.kaggle.com/datasets/hsankesara/flickr-image-dataset) via "Add Data"
-4. First cell: `!pip install faiss-cpu`
-5. Second cell: paste contents of `kaggle/notebook.py`
-6. Run
-
-The notebook auto-detects the Flickr30K path inside `/kaggle/input/`. If it can't find it, it prints debug info showing what Kaggle actually mounted. The caption-based eval runs automatically if `results.csv` is present in the dataset.
-
-### Local
 ```bash
-pip install -r requirements.txt
-FLICKR_DIR=/path/to/flickr30k_images python src/feature_extractor.py
-python src/build_index.py
-python src/evaluate_tradeoffs.py
-python src/evaluate_semantic.py
+python -m pip install -r requirements.txt
+export FLICKR_DIR=/path/to/flickr30k_images
+export FLICKR_CAPTIONS=/path/to/results.csv
+python -m src.feature_extractor
+python -m src.build_index
+python -m src.evaluate_tradeoffs
+python -m src.evaluate_semantic
 ```
 
+The extractor saves embeddings and their image paths in `data/`. Rebuild the FAISS indexes after changing the image set. For a small test of the full pipeline, use at least 300 readable images and their matching captions so that PQ has enough vectors to train.

@@ -7,12 +7,10 @@ and a 10% query set (which we'll use to test our recall later).
 
 import json
 import os
-import random
 from pathlib import Path
 
 import torch
 import numpy as np
-import faiss
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from transformers import CLIPProcessor, CLIPModel
@@ -23,30 +21,33 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 BATCH_SIZE = 64
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-print(f"Using device: {DEVICE}")
-
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def find_image_dir():
     """Find a Flickr30K image directory from env var or common Kaggle paths."""
+    configured = os.environ.get("FLICKR_DIR")
+    if configured:
+        path = Path(configured).expanduser()
+        if not path.is_dir():
+            raise FileNotFoundError(f"FLICKR_DIR does not point to a directory: {path}")
+        return path
+
     candidates = [
-        os.environ.get("FLICKR_DIR"),
+        DATA_DIR / "flickr30k_images" / "flickr30k_images",
+        DATA_DIR / "flickr30k_images",
         "/kaggle/input/flickr-image-dataset/flickr30k_images/flickr30k_images",
         "/kaggle/input/flickr-image-dataset/flickr30k_images",
         "/kaggle/input/flickr30k-images/flickr30k_images",
-        "./data/flickr30k_images",
+        "/kaggle/input/datasets/hsankesara/flickr-image-dataset/flickr30k_images/flickr30k_images",
     ]
 
     for candidate in candidates:
-        if not candidate:
-            continue
-        path = Path(candidate).expanduser()
-        if path.is_dir() and len(list(path.glob("*.jpg"))) > 100:
+        path = Path(candidate)
+        if path.is_dir() and any(path.glob("*.jpg")):
             return path
 
     raise FileNotFoundError(
-        "Flickr30K images not found. Set FLICKR_DIR=/path/to/flickr30k_images "
+        "Flickr30K images not found. Set FLICKR_DIR to the folder containing the JPG files."
     )
 
 
@@ -60,10 +61,9 @@ class ImageFolderDataset(Dataset):
     def __getitem__(self, idx):
         path = self.image_paths[idx]
         try:
-            image = Image.open(path).convert("RGB")
-            return image, str(path)
-        except Exception:
-            # Return None for corrupt images so we can filter them out
+            with Image.open(path) as image:
+                return image.convert("RGB"), str(path)
+        except OSError:
             return None
 
 def pil_collate(batch):
@@ -75,79 +75,64 @@ def pil_collate(batch):
     paths = [item[1] for item in batch]
     return images, paths
 
-def main():
-    # 1. Data Loading
-    print("Loading pre-trained CLIP model...")
-    model_name = "openai/clip-vit-base-patch32"
-    model = CLIPModel.from_pretrained(model_name).to(DEVICE)
-    processor = CLIPProcessor.from_pretrained(model_name)
-    model.eval()
-
-    print("Loading Flickr30K image paths...")
-    image_dir = find_image_dir()
-    image_paths = sorted(image_dir.glob("*.jpg"))
-    print(f"Found {len(image_paths):,} images in {image_dir}")
-
+def extract_embeddings(image_paths, model, processor):
     dataset = ImageFolderDataset(image_paths)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, collate_fn=pil_collate)
-
     all_embeddings = []
     all_paths = []
 
-    # 2. Feature Extraction
-    print("Extracting CLIP features...")
-    with torch.no_grad():
+    with torch.inference_mode():
         for images, paths in tqdm(dataloader, desc="Extracting"):
             if not images:
                 continue
-                
             inputs = processor(images=images, return_tensors="pt").to(DEVICE)
-            
-            # Call vision_model and visual_projection directly for API stability
-            # across different HuggingFace versions.
             vision_outputs = model.vision_model(pixel_values=inputs.pixel_values)
-            pooled_output = vision_outputs[1]  # pooler_output is the second element
-            features = model.visual_projection(pooled_output)
-            
+            features = model.visual_projection(vision_outputs.pooler_output)
             all_embeddings.append(features.cpu().numpy())
             all_paths.extend(paths)
+    return all_embeddings, all_paths
 
-    final_embeddings = np.concatenate(all_embeddings, axis=0).astype("float32")
-    print(f"Extraction complete! Final shape: {final_embeddings.shape}")
 
-    # L2 Normalize so that inner product perfectly matches cosine similarity
-    faiss.normalize_L2(final_embeddings)
+def save_split(embeddings, paths):
+    if len(paths) < 2:
+        raise ValueError("Need at least two readable images to split the embeddings.")
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    if not np.isfinite(norms).all() or (norms == 0).any():
+        raise ValueError("CLIP produced an invalid embedding.")
+    embeddings /= norms
 
-    # 3. Train / Query Split
     print("Creating 90/10 index/query split...")
-    num_total = len(all_paths)
-    indices = list(range(num_total))
-    random.seed(42)
-    random.shuffle(indices)
+    indices = np.random.RandomState(42).permutation(len(paths))
+    query_count = max(1, len(paths) // 10)
+    query_indices = indices[:query_count]
+    train_indices = indices[query_count:]
 
-    split_idx = int(num_total * 0.9)
-    train_indices = indices[:split_idx]
-    query_indices = indices[split_idx:]
-
-    index_embeddings = final_embeddings[train_indices]
-    index_paths = [all_paths[i] for i in train_indices]
-
-    query_embeddings = final_embeddings[query_indices]
-    query_paths = [all_paths[i] for i in query_indices]
-
-    print(f"Index set: {len(index_embeddings)} images")
-    print(f"Query set: {len(query_embeddings)} images")
-
-    # 4. Save to Disk
-    np.save(DATA_DIR / "index_embeddings.npy", index_embeddings)
-    with open(DATA_DIR / "index_paths.json", "w") as f:
-        json.dump(index_paths, f)
-
-    np.save(DATA_DIR / "query_embeddings.npy", query_embeddings)
-    with open(DATA_DIR / "query_paths.json", "w") as f:
-        json.dump(query_paths, f)
-
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for name, selected in (("index", train_indices), ("query", query_indices)):
+        np.save(DATA_DIR / f"{name}_embeddings.npy", embeddings[selected])
+        with (DATA_DIR / f"{name}_paths.json").open("w", encoding="utf-8") as file:
+            json.dump([paths[i] for i in selected], file)
+        print(f"{name.title()} set: {len(selected):,} images")
     print(f"Saved datasets to {DATA_DIR}/")
+
+
+def main():
+    image_dir = find_image_dir()
+    image_paths = sorted(path for path in image_dir.glob("*.jpg") if path.is_file())
+    if len(image_paths) < 2:
+        raise ValueError(f"Need at least two JPG images in {image_dir}.")
+    print(f"Found {len(image_paths):,} images in {image_dir}")
+
+    print(f"Loading CLIP for image encoding on {DEVICE}...")
+    model_name = "openai/clip-vit-base-patch32"
+    model = CLIPModel.from_pretrained(model_name).to(DEVICE).eval()
+    processor = CLIPProcessor.from_pretrained(model_name)
+    embeddings, paths = extract_embeddings(image_paths, model, processor)
+    print(f"Skipped {len(image_paths) - len(paths):,} unreadable images.")
+    if not embeddings:
+        raise ValueError(f"No readable JPG images in {image_dir}.")
+    save_split(np.concatenate(embeddings).astype("float32"), paths)
+
 
 if __name__ == "__main__":
     main()
